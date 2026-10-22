@@ -4,21 +4,34 @@ import pool from "./db";
 const app = express();
 app.use(express.json());
 
+pool
+  .query("SELECT NOW()")
+  .then(() => console.log("PostgreSQL connecté"))
+  .catch((err) => {
+    console.error("Erreur de connexion PostgreSQL:", err.message);
+    process.exit(1);
+  });
+
 app.get("/api/search", async (req, res) => {
   try {
-    const search = `%${req.query.q}%`;
-    const artists = await pool.query(
-      "SELECT * FROM artists WHERE name ILIKE $1",
-      [search],
-    );
-    const albums = await pool.query(
-      "SELECT * FROM albums WHERE title ILIKE $1",
-      [search],
-    );
-    const tracks = await pool.query(
-      "SELECT * FROM tracks WHERE title ILIKE $1",
-      [search],
-    );
+    const q = req.query.q;
+    if (!q) {
+      return res.status(400).json({ message: "Le paramètre q est requis" });
+    }
+
+    const [artists, albums, tracks] = await Promise.all([
+      pool.query("SELECT * FROM artists WHERE name ILIKE '%' || $1 || '%'", [
+        q,
+      ]),
+      pool.query(
+        "SELECT albums.*, artists.name AS artist FROM albums INNER JOIN artists ON albums.artist_id = artists.id WHERE title ILIKE '%' || $1 || '%'",
+        [q],
+      ),
+      pool.query(
+        "SELECT tracks.*, albums.title AS album, artists.name AS artist FROM tracks INNER JOIN albums ON tracks.album_id = albums.id INNER JOIN artists ON albums.artist_id = artists.id WHERE title ILIKE '%' || $1 || '%'",
+        [q],
+      ),
+    ]);
 
     const response = {
       artists: artists.rows,
@@ -36,6 +49,17 @@ app.get("/api/search", async (req, res) => {
 // =================== ARTISTS ======================
 // ==================================================
 
+// app.get("/api/artists", async (req, res) => {
+//   try {
+//     const result = await pool.query(
+//       "SELECT * FROM artists ORDER BY name"
+//     );
+//     res.json(result.rows);
+//   } catch (err) {
+//     res.status(500).json({ message: (err as Error).message });
+//   }
+// });
+
 app.get("/api/artists", async (req, res) => {
   try {
     const conditions: string[] = [];
@@ -52,7 +76,7 @@ app.get("/api/artists", async (req, res) => {
 
     const where =
       conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-    const query = `SELECT * FROM artists ${where}`;
+    const query = `SELECT * FROM artists ${where} ORDER BY name`;
     const result = await pool.query(query, params);
 
     res.json(result.rows);
@@ -80,20 +104,19 @@ app.get("/api/artists/:id/stats", async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
-	artists.name,
-	artists.genre,
-	COUNT(DISTINCT albums.id) AS album_count,
-	COUNT(tracks.id) AS track_count,
-	COALESCE(SUM(tracks.duration)) AS total_duration,
-	ROUND(COALESCE(AVG(tracks.duration))) AS average_track_duration
-FROM artists
-LEFT JOIN albums ON albums.artist_id = artists.id
-LEFT JOIN tracks ON tracks.album_id = albums.id
-WHERE artists.id = 6
-GROUP BY artists.id`,
+        artists.name,
+        artists.genre,
+        COUNT(DISTINCT albums.id)::int AS album_count,
+        COUNT(tracks.id)::int AS track_count,
+        COALESCE(SUM(tracks.duration), 0)::int AS total_duration,
+        ROUND(COALESCE(AVG(tracks.duration), 0), 1)::float AS average_track_duration
+       FROM artists
+       LEFT JOIN albums ON albums.artist_id = artists.id
+       LEFT JOIN tracks ON tracks.album_id = albums.id
+       WHERE artists.id = $1
+       GROUP BY artists.id`,
       [req.params.id],
     );
-
     if (result.rows.length === 0) {
       return res.status(404).json({ message: "Artiste non trouvé" });
     }
@@ -119,7 +142,7 @@ app.post("/api/artists", async (req, res) => {
     if (error.code === "23514") {
       return res.status(400).json({ message: "Données invalides" });
     }
-    res.status(500).json({ message: (error as Error).message });
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -144,7 +167,7 @@ app.put("/api/artists/:id", async (req, res) => {
       return res.status(400).json({ message: "Données invalides" });
     }
 
-    res.status(500).json({ message: (error as Error).message });
+    res.status(500).json({ message: error.message });
   }
 });
 
@@ -171,7 +194,15 @@ app.delete("/api/artists/:id", async (req, res) => {
 app.get("/api/albums", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT albums.*, artists.name AS arist, COUNT(tracks.id) AS track_count, COALESCE(SUM(tracks.duration)) AS total_duration FROM albums INNER JOIN artists ON albums.artist_id = artists.id LEFT JOIN tracks ON tracks.album_id = albums.id GROUP BY albums.id, artists.name",
+      `SELECT
+      albums.*, artists.name AS arist,
+      COUNT(tracks.id)::int AS track_count,
+      COALESCE(SUM(tracks.duration), 0)::int AS total_duration
+      FROM albums
+      INNER JOIN artists ON albums.artist_id = artists.id
+      LEFT JOIN tracks ON tracks.album_id = albums.id
+      GROUP BY albums.id, artists.name
+      ORDER BY albums.release_year DESC`,
     );
     res.json(result.rows);
   } catch (error) {
@@ -181,8 +212,15 @@ app.get("/api/albums", async (req, res) => {
 
 app.get("/api/artists/:id/albums", async (req, res) => {
   try {
+    const artist = await pool.query("SELECT * FROM artists WHERE id = $1", [
+      req.params.id,
+    ]);
+    if (artist.rows.length === 0) {
+      return res.status(404).json({ message: "Artiste non trouvé" });
+    }
+
     const result = await pool.query(
-      "SELECT * FROM albums WHERE albums.artist_id = $1",
+      "SELECT allbums.*, artists.name AS artist FROM albums INNER JOIN artists ON albums.artist_id = artists.id WHERE albums.artist_id = $1 ORDER BY albums.release_year DESC",
       [req.params.id],
     );
 
@@ -202,9 +240,6 @@ app.post("/api/albums", async (req, res) => {
 
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
-    if (error.code === "23505") {
-      return res.status(409).json({ message: "Name déjà pris" });
-    }
     if (error.code === "23514") {
       return res.status(400).json({ message: "Données invalides" });
     }
@@ -237,6 +272,13 @@ app.delete("/api/albums/:id", async (req, res) => {
 
 app.get("/api/albums/:id/tracks", async (req, res) => {
   try {
+    const album = await pool.query("SELECT * FROM albums WHERE id = $1", [
+      req.params.id,
+    ]);
+    if (album.rows.length === 0) {
+      return res.status(404).json({ message: "Album non trouvé" });
+    }
+
     const result = await pool.query(
       "SELECT * FROM tracks WHERE tracks.album_id = $1 ORDER BY track_number ASC",
       [req.params.id],
@@ -258,9 +300,6 @@ app.post("/api/tracks", async (req, res) => {
 
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
-    if (error.code === "23505") {
-      return res.status(409).json({ message: "Name déjà pris" });
-    }
     if (error.code === "23514") {
       return res.status(400).json({ message: "Données invalides" });
     }
